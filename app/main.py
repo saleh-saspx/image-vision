@@ -1,7 +1,9 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.services.vision import vision_service
@@ -20,6 +22,17 @@ app = FastAPI(
     description="Generate ERC-721 compatible NFT metadata from images using vision AI.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# CORS — allow configurable origins, default to permissive for development
+_allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(router, prefix="/api/v1")
