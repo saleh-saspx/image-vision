@@ -1,7 +1,10 @@
-from PIL import Image
 import io
+import os
 
-TARGET_SIZE = (512, 512)
+from PIL import Image
+
+_size = int(os.getenv("IMAGE_TARGET_SIZE", "384"))
+TARGET_SIZE = (_size, _size)
 
 
 def preprocess_image(raw_bytes: bytes) -> Image.Image:

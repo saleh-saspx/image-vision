@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 
 import torch
@@ -8,19 +9,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "vikhyatk/moondream2"
-REVISION = "2025-01-09"
+MODEL_ID = os.getenv("MODEL_ID", "vikhyatk/moondream2")
+REVISION = os.getenv("MODEL_REVISION", "2025-01-09")
 
-PROMPT = """Analyze this image and extract visual attributes. Return ONLY a valid JSON object with these exact keys:
-{
-  "object_type": "main subject of the image",
-  "style": "artistic style (e.g. Cyberpunk, Minimalist, Abstract, Realistic, Surreal, Pixel Art, Watercolor)",
-  "dominant_color": "single dominant color name",
-  "mood": "emotional mood (e.g. Dark, Serene, Energetic, Mysterious, Joyful)",
-  "lighting": "lighting description (e.g. Neon, Natural, Dramatic, Soft, Backlit)",
-  "environment": "background/setting description"
-}
-Return ONLY the JSON object, no other text."""
+PROMPT = """Analyze this image. Return ONLY a JSON object:
+{"object_type":"subject","style":"style","dominant_color":"color","mood":"mood","lighting":"lighting","environment":"environment"}"""
 
 
 def _select_device() -> tuple[torch.device, torch.dtype]:
@@ -44,12 +37,19 @@ class VisionService:
         self._device = device
         logger.info("Loading Moondream2 model on %s (dtype=%s)...", device, dtype)
 
+        # Set CPU thread count for torch (match OMP_NUM_THREADS)
+        cpu_threads = int(os.getenv("OMP_NUM_THREADS", "4"))
+        torch.set_num_threads(cpu_threads)
+        torch.set_num_interop_threads(max(1, cpu_threads // 2))
+        logger.info("Torch threads: intra=%d inter=%d", cpu_threads, max(1, cpu_threads // 2))
+
         self._tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=REVISION)
         self._model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             revision=REVISION,
             trust_remote_code=True,
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         )
         self._model.to(device)
         self._model.eval()

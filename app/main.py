@@ -10,6 +10,9 @@ from app.services.vision import vision_service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+# Silence noisy pyvips debug/info logs
+logging.getLogger("pyvips").setLevel(logging.WARNING)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
