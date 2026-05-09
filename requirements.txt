@@ -1,0 +1,17 @@
+# Core
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+
+# Image processing
+Pillow==11.2.1
+pyvips==2.2.3
+
+# ML inference
+torch==2.6.0
+transformers==4.51.3
+einops==0.8.1
+
+# Dev / Testing (install with: pip install -r requirements.txt)
+pytest==8.3.5
+httpx==0.28.1

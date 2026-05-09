@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  nft-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PRELOAD_MODEL: "true"
+    container_name: nft-generator
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=1
+      - LOG_LEVEL=info
+      - CACHE_MAX_SIZE=512
+      - MAX_FILE_SIZE=10485760
+      - IMAGE_TARGET_SIZE=512
+      - OMP_NUM_THREADS=4
+      - TOKENIZERS_PARALLELISM=false
+      - TRANSFORMERS_CACHE=/app/.cache/huggingface
+    volumes:
+      - model-cache:/app/.cache/huggingface
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "4.0"
+        reservations:
+          memory: 2G
+          cpus: "2.0"
+
+volumes:
+  model-cache:
+    driver: local
