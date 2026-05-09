@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import torch
 from PIL import Image
@@ -12,8 +13,11 @@ logger = logging.getLogger(__name__)
 MODEL_ID = os.getenv("MODEL_ID", "vikhyatk/moondream2")
 REVISION = os.getenv("MODEL_REVISION", "2025-01-09")
 
+# Keep prompt minimal — fewer input tokens = faster
 PROMPT = """Analyze this image. Return ONLY a JSON object:
 {"object_type":"subject","style":"style","dominant_color":"color","mood":"mood","lighting":"lighting","environment":"environment"}"""
+
+MAX_NEW_TOKENS = 150  # JSON response is ~100 tokens max
 
 
 def _select_device() -> tuple[torch.device, torch.dtype]:
@@ -37,7 +41,7 @@ class VisionService:
         self._device = device
         logger.info("Loading Moondream2 model on %s (dtype=%s)...", device, dtype)
 
-        # Set CPU thread count for torch (match OMP_NUM_THREADS)
+        # Set CPU thread count for torch
         cpu_threads = int(os.getenv("OMP_NUM_THREADS", "4"))
         torch.set_num_threads(cpu_threads)
         torch.set_num_interop_threads(max(1, cpu_threads // 2))
@@ -53,8 +57,19 @@ class VisionService:
         )
         self._model.to(device)
         self._model.eval()
+
+        # ── INT8 dynamic quantization for CPU (2-4x speedup) ──
+        if device.type == "cpu":
+            logger.info("Applying INT8 dynamic quantization for CPU...")
+            self._model = torch.quantization.quantize_dynamic(
+                self._model,
+                {torch.nn.Linear},
+                dtype=torch.qint8,
+            )
+            logger.info("INT8 quantization applied.")
+
         self._loaded = True
-        logger.info("Moondream2 model loaded successfully.")
+        logger.info("Moondream2 model ready.")
 
     @property
     def is_loaded(self) -> bool:
@@ -65,8 +80,20 @@ class VisionService:
             raise RuntimeError("Model not loaded. Wait for startup to complete.")
 
         with self._lock, torch.inference_mode():
+            t0 = time.monotonic()
+            logger.info("Encoding image...")
             enc_image = self._model.encode_image(image)
-            raw = self._model.answer_question(enc_image, PROMPT, self._tokenizer)
+            t1 = time.monotonic()
+            logger.info("Image encoded (%.2fs). Generating answer (max %d tokens)...", t1 - t0, MAX_NEW_TOKENS)
+
+            raw = self._model.answer_question(
+                enc_image,
+                PROMPT,
+                self._tokenizer,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+            t2 = time.monotonic()
+            logger.info("Answer generated (%.2fs). Raw output: %s", t2 - t1, raw[:200])
 
         return self._parse_response(raw)
 

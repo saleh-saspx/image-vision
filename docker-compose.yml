@@ -17,7 +17,7 @@ services:
       - LOG_LEVEL=info
       - CACHE_MAX_SIZE=512
       - MAX_FILE_SIZE=10485760
-      - IMAGE_TARGET_SIZE=384
+      - IMAGE_TARGET_SIZE=256
       - OMP_NUM_THREADS=8
       - TOKENIZERS_PARALLELISM=false
       - TRANSFORMERS_CACHE=/app/.cache/huggingface
