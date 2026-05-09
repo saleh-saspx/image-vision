@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        PRELOAD_MODEL: "true"
+        PRELOAD_MODEL: "false"
     container_name: nft-generator
     ports:
       - "${PORT:-8000}:8000"
@@ -31,14 +31,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: "4.0"
-        reservations:
-          memory: 2G
-          cpus: "2.0"
 
 volumes:
   model-cache:

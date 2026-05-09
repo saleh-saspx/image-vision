@@ -20,14 +20,6 @@ PROMPT = """Analyze this image. Return ONLY a JSON object:
 MAX_NEW_TOKENS = 150  # JSON response is ~100 tokens max
 
 
-def _select_device() -> tuple[torch.device, torch.dtype]:
-    if torch.cuda.is_available():
-        return torch.device("cuda"), torch.float16
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps"), torch.float32
-    return torch.device("cpu"), torch.float32
-
-
 class VisionService:
     def __init__(self) -> None:
         self._model = None
@@ -37,11 +29,19 @@ class VisionService:
         self._device: torch.device | None = None
 
     def load_model(self) -> None:
-        device, dtype = _select_device()
-        self._device = device
-        logger.info("Loading Moondream2 model on %s (dtype=%s)...", device, dtype)
+        # ── Always use float16 to halve memory usage ──
+        # CPU fp16 is slower than fp32 per-op but uses half the RAM,
+        # which prevents OOM on small VPS instances.
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.float16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float16  # half memory on CPU
 
-        # Set CPU thread count for torch
+        self._device = device
+        logger.info("Loading Moondream2 on %s (dtype=%s)...", device, dtype)
+
         cpu_threads = int(os.getenv("OMP_NUM_THREADS", "4"))
         torch.set_num_threads(cpu_threads)
         torch.set_num_interop_threads(max(1, cpu_threads // 2))
@@ -58,18 +58,11 @@ class VisionService:
         self._model.to(device)
         self._model.eval()
 
-        # ── INT8 dynamic quantization for CPU (2-4x speedup) ──
-        if device.type == "cpu":
-            logger.info("Applying INT8 dynamic quantization for CPU...")
-            self._model = torch.quantization.quantize_dynamic(
-                self._model,
-                {torch.nn.Linear},
-                dtype=torch.qint8,
-            )
-            logger.info("INT8 quantization applied.")
-
         self._loaded = True
-        logger.info("Moondream2 model ready.")
+
+        # Log memory footprint
+        param_bytes = sum(p.nelement() * p.element_size() for p in self._model.parameters())
+        logger.info("Moondream2 ready. Model size: %.0f MB", param_bytes / 1024 / 1024)
 
     @property
     def is_loaded(self) -> bool:
@@ -111,7 +104,6 @@ class VisionService:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Fall back: extract first JSON object from noisy output
             start = raw.find("{")
             end = raw.rfind("}") + 1
             if start != -1 and end > start:
