@@ -11,4 +11,5 @@ if __name__ == "__main__":
         port=settings.PORT,
         workers=settings.WORKERS,
         log_level=settings.LOG_LEVEL,
+        timeout_keep_alive=180,
     )
