@@ -6,9 +6,11 @@ def _dummy_response(hash_val: str = "abc") -> NFTResponse:
     return NFTResponse(
         image_hash=hash_val,
         metadata=NFTMetadata(
-            name="Test",
-            description="Test desc",
-            attributes=[Attribute(trait_type="Style", value="Test")],
+            name="Classic Blue Sofa",
+            title="Classic Blue Sofa",
+            description="A classic blue sofa.",
+            attributes=[Attribute(trait_type="Style", value="Classic")],
+            confidence={"style": 0.78},
         ),
     )
 

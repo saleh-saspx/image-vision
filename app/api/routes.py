@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_TYPES = {"image/jpeg", "image/png"}
+ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 @router.post("/generate", response_model=NFTResponse)
@@ -20,7 +20,7 @@ async def generate_nft_metadata(file: UploadFile = File(...)):
     logger.info("Received upload: name=%s type=%s", file.filename, file.content_type)
 
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(400, f"Unsupported file type: {file.content_type}. Use JPEG or PNG.")
+        raise HTTPException(400, f"Unsupported file type: {file.content_type}. Use JPEG, PNG or WebP.")
 
     raw_bytes = await file.read()
     if len(raw_bytes) > MAX_FILE_SIZE:
