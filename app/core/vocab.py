@@ -23,6 +23,50 @@ _NULL_VALUES = {
     "undefined", "no", "nothing", "not applicable", "-",
 }
 
+# A small VLM frequently echoes the schema back instead of describing the image:
+# asked for "main subject" it answers "main subject". These reach the creator as
+# "Gray Main Subject" or a tag called `object`, which is worse than an empty
+# field — the whole point is metadata a human would accept without editing.
+# Every one of these is dropped as if the model had said nothing.
+_PLACEHOLDER_VALUES = {
+    "subject", "subjects", "main subject", "primary subject", "other subject",
+    "other subjects", "secondary subject", "secondary subjects",
+    "object", "objects", "generic object", "visible object", "visible objects",
+    "item", "items", "thing", "things", "stuff", "element", "elements",
+    "artwork", "art work", "art", "image", "picture", "scene", "place",
+    "setting", "background", "foreground", "content", "description", "title",
+    "style", "color", "colour", "colors", "colours", "material", "materials",
+    # "medium" is absent here on purpose — see _FIELD_PLACEHOLDERS below.
+    "mood", "lighting", "texture", "pattern", "category",
+    "various", "several", "multiple", "other", "misc", "miscellaneous",
+    "n a", "tbd", "todo", "example", "sample", "placeholder", "text", "value",
+}
+
+# Some words are a placeholder in one field and a real answer in another.
+# "Medium" is the canonical visual_complexity value, but as an art_medium it is
+# just the schema echoed back, so the check has to know which field it is in.
+_FIELD_PLACEHOLDERS: dict[str, set[str]] = {
+    "art_medium": {"medium", "art medium", "mediums"},
+    "visual_complexity": {"complexity", "visual complexity"},
+    "primary_subject": {"main", "primary", "focus", "centerpiece"},
+    "environment": {"environment", "env"},
+    "composition": {"composition"},
+    "perspective": {"perspective", "angle", "view", "camera angle"},
+}
+
+# The same schema-echo wearing qualifiers or an index: "Other Notable
+# Subjects", "Generic Object", "Visible Objects", "Object 1", "Item #2".
+# Enumerating the exact phrases does not scale — the model recombines these
+# words freely — so the shape is matched instead: any number of vague
+# qualifiers followed by a vague noun, optionally numbered.
+_PLACEHOLDER_RE = re.compile(
+    r"^(?:(?:other|another|additional|more|secondary|primary|main|generic|"
+    r"visible|notable|important|key|various|several|misc|unnamed|unidentified)\s+)*"
+    r"(?:object|item|subject|thing|element|artwork|image|entity|figure|detail|"
+    r"feature|piece|content)s?"
+    r"(?:\s*#?\s*(?:\d+|[a-z]))?$"
+)
+
 # ---------------------------------------------------------------------------
 # Vocabularies: canonical value -> extra surface forms that map onto it.
 # The canonical value itself is always matched, no need to repeat it.
@@ -49,6 +93,8 @@ STYLE = {
     "Gothic": ["goth", "dark gothic"],
     "Bohemian": ["boho", "eclectic"],
     "Scandinavian": ["nordic", "scandi"],
+    "Luxury": ["luxurious", "opulent", "high end", "premium", "lavish"],
+    "Rustic": ["farmhouse", "country style", "rural", "weathered wood"],
     "Art Deco": ["deco", "art-deco"],
     "Grunge": ["distressed", "gritty"],
     "Low Poly": ["lowpoly", "low-poly", "polygonal"],
@@ -192,7 +238,10 @@ MATERIAL = {
     "Metal": ["metallic", "steel", "iron", "aluminum", "aluminium", "brass", "copper", "chrome"],
     "Gold": ["golden", "gilded", "gilt"],
     "Silver": ["silvery", "platinum"],
-    "Glass": ["crystal", "transparent glass"],
+    "Glass": ["transparent glass", "glassy"],
+    # Distinct from Glass on purpose: "Crystal Dragon" and "Crystal Vase" are
+    # real NFT subjects, and collapsing them into "Glass" loses the trait.
+    "Crystal": ["crystalline", "quartz", "gemstone", "diamond"],
     "Stone": ["marble", "granite", "rock", "concrete", "cement"],
     "Plastic": ["acrylic plastic", "vinyl", "resin"],
     "Paper": ["cardboard", "parchment"],
@@ -203,26 +252,25 @@ MATERIAL = {
 }
 
 CATEGORY = {
-    "Art": ["artwork", "fine art", "painting"],
-    "Photography": ["photo", "photograph"],
     "Furniture": ["interior furniture", "home furniture"],
-    "Interior": ["interior design", "interior scene", "home decor", "decor"],
+    "Photography": ["photo", "photograph"],
+    "Digital Art": ["digital", "cg art", "3d art", "pixel art", "generative art"],
+    "Painting": ["painted", "fine art", "canvas"],
+    "Illustration": ["illustrated", "drawing", "comic art"],
     "Architecture": ["building", "architectural"],
+    "Interior Design": ["interior", "interior scene", "home decor", "decor", "interiors"],
     "Landscape": ["scenery", "nature scene", "vista"],
     "Portrait": ["headshot", "person portrait", "face"],
-    "Collectible": ["collectable", "pfp", "avatar"],
+    "Fashion": ["clothing", "apparel", "outfit"],
     "Gaming": ["game", "game asset", "video game"],
-    "Music": ["musical", "instrument"],
-    "Fashion": ["clothing", "apparel", "outfit", "style fashion"],
-    "Vehicle": ["car", "automotive", "transport", "ship", "aircraft"],
-    "Animal": ["creature", "pet", "wildlife"],
-    "Food": ["cuisine", "meal", "drink"],
     "Fantasy": ["mythical", "magic"],
+    "Collectible": ["collectable", "pfp", "avatar"],
     "Abstract": ["non representational"],
-    "Pixel Art": ["pixel"],
-    "3D": ["3d art", "three dimensional"],
-    "Anime": ["manga"],
+    "Vehicle": ["car", "automotive", "transport", "ship", "aircraft"],
     "Nature": ["botanical", "plants"],
+    "Animal": ["creature", "pet", "wildlife"],
+    "Technology": ["tech", "electronics", "gadget", "device"],
+    "Anime": ["manga", "anime art"],
 }
 
 VISUAL_COMPLEXITY = {
@@ -268,7 +316,26 @@ def clean_text(value: object) -> str:
         return ""
     text = str(value).strip().strip("\"'.,;:").lower()
     text = re.sub(r"\s+", " ", text)
-    return "" if text in _NULL_VALUES else text
+
+    # An uncopied prompt slot, e.g. "<room or place>". Always a non-answer.
+    if text.startswith("<") or text.endswith(">"):
+        return ""
+    if text in _NULL_VALUES or text in _PLACEHOLDER_VALUES:
+        return ""
+    if _PLACEHOLDER_RE.match(text):
+        return ""
+    return text
+
+
+def clean_open_text(field: str, value: object) -> str:
+    """clean_text for open-vocabulary fields, honouring per-field placeholders."""
+    text = clean_text(value)
+    return "" if text in _FIELD_PLACEHOLDERS.get(field, ()) else text
+
+
+def is_placeholder(value: object) -> bool:
+    """True when the model echoed the schema instead of describing the image."""
+    return not clean_text(value)
 
 
 def _tokens(text: str) -> set[str]:
@@ -281,7 +348,7 @@ def normalize(field: str, value: object) -> tuple[str | None, str]:
     Returns (canonical_value_or_None, match_tier).
     """
     text = clean_text(value)
-    if not text:
+    if not text or text in _FIELD_PLACEHOLDERS.get(field, ()):
         return None, MATCH_NONE
 
     lookup = _LOOKUPS.get(field)

@@ -9,7 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageStat
+
+# Every analyser below works on a downscaled copy. Producing that copy once and
+# sharing it is the single biggest win in this module: the four analysers used
+# to each copy and resize the full-resolution image independently, doing the
+# same expensive work four times over.
+_BASE_SIZE = 128
 
 # Named palette: NFT metadata is filtered by humans, so colour names must be the
 # ones a creator would type ("Light Blue"), not "#A3C4E0" or "cornflower".
@@ -70,6 +76,26 @@ class ImageStats:
     orientation: str = "Square"
     aspect_ratio: float = 1.0
     is_grayscale: bool = False
+    # Lighting read from the pixels. Only used when the model did not name it —
+    # a fallback, never an override.
+    lighting: str | None = None
+    lighting_confidence: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    warmth: float = 0.0
+
+
+def _thumbnail(image: Image.Image, size: int) -> Image.Image:
+    """Downscale to fit `size`, or hand back the original when already small.
+
+    Skipping the copy for images that are already below the target is what lets
+    analyze_pixels share one base thumbnail across every analyser.
+    """
+    if max(image.size) <= size:
+        return image
+    thumb = image.copy()
+    thumb.thumbnail((size, size), Image.BILINEAR)
+    return thumb
 
 
 def _srgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
@@ -94,11 +120,30 @@ def _srgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
 
 _NAMED_LAB = [(name, _srgb_to_lab(rgb)) for name, rgb in _NAMED_COLORS]
 
+# Achromatic names. They sit in the middle of Lab space and therefore act as
+# attractors: a warm off-white wall lands on "Off White" and a pale blue sofa
+# on "Light Gray", which is exactly the flat, useless palette a creator would
+# delete. Once a colour carries visible tint we drop these from the running and
+# force a name that says something ("Cream", "Light Blue").
+_NEUTRAL_NAMES = {
+    "Black", "Charcoal", "Dark Gray", "Gray", "Light Gray",
+    "White", "Off White", "Silver",
+}
+
+# Lab chroma above which a colour is no longer meaningfully neutral. Low enough
+# to catch subtle tints, high enough that genuine greys stay grey.
+_NEUTRAL_CHROMA_MAX = 7.0
+
+_CHROMATIC_LAB = [(name, lab) for name, lab in _NAMED_LAB if name not in _NEUTRAL_NAMES]
+
 
 def name_color(rgb: tuple[int, int, int]) -> str:
     lab = _srgb_to_lab(rgb)
+    chroma = (lab[1] ** 2 + lab[2] ** 2) ** 0.5
+
+    candidates = _NAMED_LAB if chroma <= _NEUTRAL_CHROMA_MAX else _CHROMATIC_LAB
     return min(
-        _NAMED_LAB,
+        candidates,
         key=lambda item: sum((a - b) ** 2 for a, b in zip(lab, item[1])),
     )[0]
 
@@ -109,8 +154,7 @@ def extract_palette(image: Image.Image, max_colors: int = 5) -> tuple[list[str],
     Quantising a 96px thumbnail is ~1ms and loses nothing: dominant colour is a
     low-frequency property, so full resolution buys no accuracy.
     """
-    thumb = image.copy()
-    thumb.thumbnail((96, 96), Image.BILINEAR)
+    thumb = _thumbnail(image, 96)
 
     quantized = thumb.quantize(colors=16, method=Image.MEDIANCUT, dither=Image.NONE)
     palette = quantized.getpalette() or []
@@ -141,8 +185,7 @@ def measure_complexity(image: Image.Image) -> tuple[str, float]:
     energy, which tracks what creators mean by "Highly Detailed" better than
     any label the model would guess.
     """
-    thumb = image.copy().convert("L")
-    thumb.thumbnail((128, 128), Image.BILINEAR)
+    thumb = _thumbnail(image, 128).convert("L")
 
     edges = thumb.filter(ImageFilter.FIND_EDGES)
     histogram = edges.histogram()
@@ -162,6 +205,50 @@ def measure_complexity(image: Image.Image) -> tuple[str, float]:
     return label, round(score, 4)
 
 
+def estimate_lighting(image: Image.Image) -> tuple[str | None, float, float, float, float]:
+    """Infer lighting from luminance and colour temperature.
+
+    A dark frame is obviously low-light and a warm-cast frame is obviously warm
+    lit — returning null for those, as the previous version did, made the
+    creator fill in something the pixels already stated. Confidence stays
+    modest because brightness alone cannot distinguish, say, backlit from
+    overcast; the model's own answer always wins when it gives one.
+
+    Returns (lighting, confidence, brightness, contrast, warmth).
+    """
+    thumb = _thumbnail(image, 64)
+
+    # ImageStat runs in C. The equivalent Python loop over even a 64px
+    # thumbnail was the slowest thing in this module.
+    gray_stat = ImageStat.Stat(thumb.convert("L"))
+    brightness = gray_stat.mean[0] / 255.0
+    contrast = gray_stat.stddev[0] / 255.0
+
+    # Mean b* in Lab: positive is yellow (warm), negative is blue (cool).
+    # One conversion of the average colour, not one per pixel.
+    rgb_stat = ImageStat.Stat(thumb)
+    average = tuple(int(c) for c in rgb_stat.mean[:3])
+    warmth = _srgb_to_lab(average)[2]
+
+    if brightness < 0.16:
+        lighting, confidence = "Night", 0.62
+    elif brightness < 0.30:
+        lighting, confidence = "Low Light", 0.58
+    elif brightness > 0.80 and contrast < 0.14:
+        # Bright and flat is the signature of a lit studio backdrop.
+        lighting, confidence = "Soft Light", 0.50
+    elif warmth > 14:
+        lighting, confidence = "Warm Light", 0.52
+    elif warmth < -8:
+        lighting, confidence = "Cool Light", 0.52
+    elif brightness > 0.55:
+        lighting, confidence = "Natural Daylight", 0.45
+    else:
+        lighting, confidence = None, 0.0
+
+    return lighting, confidence, round(brightness, 4), round(contrast, 4), round(warmth, 2)
+
+
 def _orientation(width: int, height: int) -> tuple[str, float]:
     ratio = width / height if height else 1.0
     if 0.95 <= ratio <= 1.05:
@@ -170,8 +257,7 @@ def _orientation(width: int, height: int) -> tuple[str, float]:
 
 
 def _is_grayscale(image: Image.Image) -> bool:
-    thumb = image.copy()
-    thumb.thumbnail((48, 48), Image.BILINEAR)
+    thumb = _thumbnail(image, 48)
     return all(
         max(pixel[:3]) - min(pixel[:3]) <= 12
         for pixel in thumb.getdata()
@@ -180,9 +266,15 @@ def _is_grayscale(image: Image.Image) -> bool:
 
 def analyze_pixels(image: Image.Image) -> ImageStats:
     """Single pass over a thumbnail; runs before the model, costs ~5ms."""
-    colors, weights = extract_palette(image)
-    complexity, score = measure_complexity(image)
+    # One downscale, shared by every analyser below. Orientation is read from
+    # the original dimensions, since the thumbnail preserves aspect ratio but
+    # not size.
     orientation, ratio = _orientation(*image.size)
+    base = _thumbnail(image, _BASE_SIZE)
+
+    colors, weights = extract_palette(base)
+    complexity, score = measure_complexity(base)
+    lighting, lighting_confidence, brightness, contrast, warmth = estimate_lighting(base)
 
     return ImageStats(
         colors=colors,
@@ -191,5 +283,10 @@ def analyze_pixels(image: Image.Image) -> ImageStats:
         complexity_score=score,
         orientation=orientation,
         aspect_ratio=round(ratio, 3),
-        is_grayscale=_is_grayscale(image),
+        is_grayscale=_is_grayscale(base),
+        lighting=lighting,
+        lighting_confidence=lighting_confidence,
+        brightness=brightness,
+        contrast=contrast,
+        warmth=warmth,
     )

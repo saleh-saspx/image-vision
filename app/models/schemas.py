@@ -1,4 +1,13 @@
+from enum import Enum
+
 from pydantic import BaseModel, Field
+
+
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class Attribute(BaseModel):
@@ -48,6 +57,41 @@ class NFTResponse(BaseModel):
     metadata: NFTMetadata
     duration_ms: int | None = None
     cached: bool = False
+
+
+class JobAccepted(BaseModel):
+    """Returned immediately by POST /generate — the upload is queued, not done."""
+
+    job_id: str
+    image_hash: str
+    status: JobStatus
+    poll_url: str
+    queue_position: int | None = None
+    # True when this upload joined an in-flight or finished job for the same
+    # image instead of queueing new work.
+    deduplicated: bool = False
+
+
+class JobResult(BaseModel):
+    job_id: str
+    image_hash: str
+    status: JobStatus
+    metadata: NFTMetadata | None = None
+    error: str | None = None
+    queue_position: int | None = None
+    waited_ms: int | None = None
+    duration_ms: int | None = None
+    cached: bool = False
+
+
+class QueueStats(BaseModel):
+    queued: int
+    processing: int
+    completed: int
+    failed: int
+    total: int
+    workers: int
+    capacity: int
 
 
 class HealthResponse(BaseModel):

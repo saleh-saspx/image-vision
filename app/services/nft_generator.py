@@ -7,6 +7,7 @@ carries the confidence of its weakest input.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 from app.core import vocab
@@ -28,6 +29,11 @@ _TIER_CONFIDENCE = {
     vocab.MATCH_NONE: 0.0,
 }
 
+# Below this, a value is not worth showing: the creator would have to verify it
+# against the image anyway, and a wrong pre-filled field costs more attention
+# than an empty one. Such fields are returned as null.
+MIN_CONFIDENCE = 0.40
+
 # Measured, not guessed.
 CONF_MEASURED = 0.88
 CONF_DERIVED_STRONG = 0.7   # rule-derived from several agreeing fields
@@ -41,11 +47,17 @@ def _slug(text: str) -> str:
 
 
 def _clean_subject(raw: str) -> str:
-    text = vocab.clean_text(raw)
+    """Open-vocabulary cleaning for subjects and objects.
+
+    Strips leading articles so "a sofa set" becomes "Sofa Set", and rejects the
+    schema-echo values the model falls back on when it cannot identify anything.
+    """
+    text = vocab.clean_open_text("primary_subject", raw)
     if not text:
         return ""
     text = _SUBJECT_STOP.sub("", text)
-    return vocab._titleize(text)
+    # An article may have been hiding a placeholder: "the object".
+    return vocab._titleize(text) if vocab.clean_open_text("primary_subject", text) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +104,11 @@ def normalize_fields(raw: dict) -> tuple[dict, dict[str, float]]:
         confidence["secondary_subjects"] = 0.55
 
     objects = _dedupe([_clean_subject(o) for o in raw.get("objects", []) or []])
+    if not objects and subject:
+        # The subject is by definition a visible object. Leaving the list empty
+        # when we can name the thing in the frame is a gap the creator has to
+        # fill by hand for no reason.
+        objects = [subject]
     if objects:
         fields["objects"] = objects[:15]
         confidence["objects"] = 0.58
@@ -147,25 +164,43 @@ def apply_image_stats(fields: dict, confidence: dict[str, float], stats: ImageSt
 # of a sofa belongs in Furniture, because "3D Render" is already carried by the
 # art_medium facet and repeating it as the category costs a filtering axis.
 _CATEGORY_RULES: list[tuple[str, tuple[str, ...]]] = [
+    # People only. A "samurai helmet" is an object, not a portrait, so
+    # character words live in Collectible below and lose to Fashion first.
     ("Portrait", ("portrait", "face", "man", "woman", "person", "girl", "boy", "head")),
-    ("Animal", ("cat", "dog", "bird", "horse", "lion", "tiger", "fish", "animal", "creature", "ape", "monkey")),
-    ("Vehicle", ("car", "vehicle", "motorcycle", "ship", "plane", "aircraft", "truck", "spaceship")),
-    ("Furniture", ("sofa", "chair", "table", "couch", "desk", "cabinet", "bed", "shelf", "lamp", "vase", "furniture")),
-    ("Interior", ("living room", "bedroom", "kitchen", "dining room", "bathroom", "office", "interior")),
-    ("Architecture", ("building", "house", "tower", "bridge", "temple", "castle", "architecture", "cathedral")),
-    ("Landscape", ("mountain", "forest", "beach", "desert", "ocean", "sky", "landscape", "valley", "lake")),
-    ("Fashion", ("dress", "shoe", "jacket", "hat", "clothing", "outfit", "bag", "watch")),
-    ("Food", ("food", "fruit", "drink", "coffee", "cake", "meal", "bottle")),
-    ("Fantasy", ("dragon", "wizard", "elf", "knight", "fantasy", "magical", "mythical")),
-    ("Nature", ("plant", "flower", "tree", "leaf", "nature")),
+    ("Animal", ("cat", "dog", "bird", "horse", "lion", "tiger", "fish", "animal", "creature", "ape", "monkey", "wolf", "bear")),
+    ("Vehicle", ("car", "vehicle", "motorcycle", "ship", "plane", "aircraft", "truck", "spaceship", "boat", "bike")),
+    ("Furniture", ("sofa", "chair", "table", "couch", "desk", "cabinet", "bed", "shelf", "lamp", "vase", "furniture", "armchair", "stool", "dresser")),
+    ("Interior Design", ("living room", "bedroom", "kitchen", "dining room", "bathroom", "office", "interior", "hallway")),
+    ("Architecture", ("building", "house", "tower", "bridge", "temple", "castle", "architecture",
+                      "cathedral", "facade", "street", "city", "cityscape", "alley", "skyline", "urban")),
+    ("Landscape", ("mountain", "forest", "beach", "desert", "ocean", "sky", "landscape", "valley", "lake", "sunset", "island")),
+    ("Fashion", ("dress", "shoe", "jacket", "hat", "clothing", "outfit", "bag", "watch", "sneaker", "helmet")),
+    ("Technology", ("robot", "computer", "laptop", "phone", "circuit", "drone", "machine", "android", "cyborg", "server")),
+    ("Fantasy", ("dragon", "wizard", "elf", "knight", "fantasy", "magical", "mythical", "sorcerer")),
+    ("Nature", ("plant", "flower", "tree", "leaf", "nature", "garden")),
     ("Abstract", ("abstract", "geometric", "shapes")),
-    ("Gaming", ("game", "gaming", "avatar", "character")),
-    # Medium-driven fallbacks, only reached when the subject says nothing.
-    ("Pixel Art", ("pixel art",)),
-    ("Anime", ("anime", "manga")),
-    ("3D", ("3d render", "low poly")),
-    ("Photography", ("photography",)),
+    ("Gaming", ("game", "gaming", "video game")),
+    ("Anime", ("anime", "manga", "chibi", "waifu")),
+    ("Collectible", ("avatar", "pfp", "collectible", "character", "warrior", "samurai", "ninja", "soldier")),
 ]
+
+# Reached only when the subject says nothing recognisable. Category then falls
+# back to how the piece was made, which is always better than guessing a
+# subject we could not identify.
+_MEDIUM_CATEGORY = {
+    "Photography": "Photography",
+    "Oil Painting": "Painting",
+    "Watercolor": "Painting",
+    "Acrylic Painting": "Painting",
+    "Pencil Sketch": "Illustration",
+    "Ink Illustration": "Illustration",
+    "Vector Illustration": "Illustration",
+    "Digital Art": "Digital Art",
+    "3D Render": "Digital Art",
+    "Pixel Art": "Digital Art",
+    "Collage": "Illustration",
+    "Sculpture": "Collectible",
+}
 
 
 # Whole-word matching is mandatory here: plain substring search puts a "street"
@@ -177,23 +212,120 @@ _CATEGORY_PATTERNS = [
 
 
 def infer_category(fields: dict) -> tuple[str | None, float]:
-    haystack = " ".join(
-        str(fields.get(key, "")).lower()
-        for key in ("primary_subject", "scene", "style", "art_medium", "environment")
+    """Two passes: what the image is *of* decides before where it *is*.
+
+    A crystal dragon on a mountain is Fantasy, not Landscape — merging subject
+    and scene into one haystack let rule order silently pick the wrong one.
+    """
+    # The named subject is the strongest signal and is checked alone first: a
+    # "cyberpunk street" that happens to contain a car is not a Vehicle listing.
+    # A category inferred from incidental objects is scored lower accordingly.
+    passes = (
+        (str(fields.get("primary_subject") or "").lower(), CONF_DERIVED_STRONG),
+        (
+            " ".join(str(fields.get(key, "")).lower() for key in ("scene", "environment")),
+            CONF_DERIVED_STRONG,
+        ),
+        (" ".join(o.lower() for o in fields.get("objects", []) or []), 0.6),
+        (str(fields.get("style") or "").lower(), 0.55),
     )
-    haystack += " " + " ".join(o.lower() for o in fields.get("objects", []) or [])
 
-    for category, pattern in _CATEGORY_PATTERNS:
-        if pattern.search(haystack):
-            return category, CONF_DERIVED_STRONG
+    for haystack, confidence in passes:
+        if not haystack.strip():
+            continue
+        for category, pattern in _CATEGORY_PATTERNS:
+            if pattern.search(haystack):
+                return category, confidence
 
-    # Fall back on medium: a photo is Photography, anything else is Art.
-    medium = fields.get("art_medium")
-    if medium == "Photography":
-        return "Photography", CONF_DERIVED_WEAK
+    medium = _MEDIUM_CATEGORY.get(str(fields.get("art_medium") or ""))
     if medium:
-        return "Art", CONF_DERIVED_WEAK
+        return medium, CONF_DERIVED_WEAK
     return None, 0.0
+
+
+# ---------------------------------------------------------------------------
+# Gap filling
+# ---------------------------------------------------------------------------
+# A small model routinely answers three of thirteen questions and drops the
+# rest. Leaving those null forces the creator to type facts that are already
+# implied by what the model *did* say, so each gap is filled by deduction from
+# an observed field — never by invention, and always at a lower confidence than
+# a direct observation.
+
+# Objects that place a scene beyond reasonable doubt.
+_SCENE_FROM_OBJECTS: list[tuple[str, tuple[str, ...]]] = [
+    ("Living Room", ("sofa", "couch", "armchair", "coffee table", "tv", "television")),
+    ("Bedroom", ("bed", "nightstand", "headboard", "duvet", "mattress")),
+    ("Kitchen", ("stove", "oven", "sink", "refrigerator", "fridge", "countertop", "cookware")),
+    ("Office", ("desk", "monitor", "keyboard", "laptop", "computer")),
+    ("Bathroom", ("bathtub", "shower", "toilet", "basin")),
+    ("Beach", ("sand", "wave", "waves", "palm", "seashell", "surf")),
+    ("Forest", ("trees", "pine", "foliage", "undergrowth")),
+    ("Street", ("streetlight", "sidewalk", "crosswalk", "traffic light", "storefront")),
+    ("Mountain", ("peak", "summit", "cliff", "ridge")),
+]
+
+# Scene -> environment. A living room is indoors; this needs no model.
+_ENVIRONMENT_FROM_SCENE = {
+    "Living Room": "Indoor", "Bedroom": "Indoor", "Kitchen": "Indoor",
+    "Dining Room": "Indoor", "Bathroom": "Indoor", "Office": "Indoor",
+    "Cafe": "Indoor", "Museum": "Indoor", "Laboratory": "Indoor",
+    "Studio": "Studio",
+    "Beach": "Outdoor", "Ocean": "Outdoor", "Mountain": "Outdoor",
+    "Forest": "Outdoor", "Desert": "Outdoor", "Garden": "Outdoor",
+    "Street": "Outdoor", "City": "Outdoor", "Sky": "Outdoor",
+    "Space": "Outer Space",
+}
+
+# Colour-like materials are excluded from lexical inference: "golden retriever"
+# and "silver fox" are not made of metal.
+_LEXICAL_MATERIAL_DENY = {"Gold", "Silver"}
+
+
+def infer_scene(fields: dict) -> tuple[str | None, float]:
+    """Deduce the setting from objects that only occur in one kind of room."""
+    haystack = " ".join(
+        [str(fields.get("primary_subject") or "").lower()]
+        + [o.lower() for o in fields.get("objects", []) or []]
+    )
+    if not haystack.strip():
+        return None, 0.0
+
+    for scene, keywords in _SCENE_FROM_OBJECTS:
+        if any(re.search(rf"\b{re.escape(kw)}\b", haystack) for kw in keywords):
+            return scene, 0.55
+    return None, 0.0
+
+
+def infer_environment(fields: dict) -> tuple[str | None, float]:
+    environment = _ENVIRONMENT_FROM_SCENE.get(str(fields.get("scene") or ""))
+    # Near-certain: the mapping is definitional, not a guess about the image.
+    return (environment, 0.75) if environment else (None, 0.0)
+
+
+def infer_materials(fields: dict) -> tuple[list[str], float]:
+    """Pull materials out of wording the model already produced.
+
+    "Vintage Wooden Armchair" states its material; requiring the model to also
+    fill a separate materials field before we record it wastes an observation
+    we already have.
+    """
+    words: list[str] = []
+    for text in [fields.get("primary_subject")] + list(fields.get("objects") or []):
+        if text:
+            words.extend(str(text).lower().split())
+
+    found: list[str] = []
+    for word in words:
+        value, tier = vocab.normalize("material", word)
+        if (
+            tier == vocab.MATCH_EXACT
+            and value not in found
+            and value not in _LEXICAL_MATERIAL_DENY
+        ):
+            found.append(value)
+
+    return (found[:3], 0.55) if found else ([], 0.0)
 
 
 def infer_composition(fields: dict, stats: ImageStats) -> tuple[str, float]:
@@ -234,10 +366,19 @@ def generate_title(fields: dict) -> tuple[str, float]:
     noun = subject or scene or fields.get("category") or "Composition"
     noun_words = {w.lower() for w in noun.split()}
 
+    style = fields.get("style")
+
+    # An already-descriptive subject needs at most one modifier; stacking more
+    # turns a title into a keyword list. Two cases count as descriptive: a long
+    # subject ("Vintage Wooden Armchair"), or one that already states the style
+    # ("Cyberpunk Street" — do not then reach for "Metal" to fill the slot).
+    style_already_in_noun = bool(style and style.lower() in noun.lower())
+    max_modifiers = 1 if len(noun.split()) >= 3 or style_already_in_noun else 2
+
     modifiers: list[str] = []
 
     def add(candidate: str | None) -> None:
-        if not candidate or len(modifiers) >= 2:
+        if not candidate or len(modifiers) >= max_modifiers:
             return
         if candidate in _TITLE_UNSUITABLE:
             return
@@ -250,7 +391,6 @@ def generate_title(fields: dict) -> tuple[str, float]:
         modifiers.append(candidate)
         noun_words.update(w.lower() for w in words)
 
-    style = fields.get("style")
     colors = fields.get("dominant_colors") or []
     materials = fields.get("materials") or []
 
@@ -324,6 +464,25 @@ _MEDIUM_PHRASES = {
 }
 
 
+# Phrasing variants. Every listing in a collection running through one fixed
+# sentence shape reads as machine output, so the connectives rotate. Selection
+# is keyed off the content itself, which keeps a given image's description
+# stable across regenerations while different images read differently.
+_COLOR_CONNECTIVES = ("in {colors} tones", "finished in {colors}", "with {colors} tones")
+_SCENE_CONNECTIVES = ("set", "placed", "positioned")
+_ATMOSPHERE_TEMPLATES = (
+    "{lighting_cap} gives the piece {mood_article} {mood} feel.",
+    "The {mood} mood is carried by {lighting}.",
+    "{lighting_cap} lends it {mood_article} {mood} character.",
+)
+
+
+def _variant(seed: str, options: tuple) -> object:
+    """Deterministic pick — same image always yields the same phrasing."""
+    digest = hashlib.md5(seed.encode()).digest()
+    return options[digest[0] % len(options)]
+
+
 def generate_description(fields: dict) -> tuple[str, float]:
     """Assemble prose from observed fields only — no filler adjectives."""
     subject = (fields.get("primary_subject") or fields.get("scene") or "composition").lower()
@@ -339,19 +498,31 @@ def generate_description(fields: dict) -> tuple[str, float]:
 
     # ── Sentence 1: what it is, in what style, what colour, where ──
     head_parts = []
-    if style:
+    # "cyberpunk-style cyberpunk street" — the subject may already carry it.
+    if style and style.lower() not in subject:
         head_parts.append(f"{style.lower()}-style")
-    if materials:
+    # "wood vintage wooden armchair" — skip a material the subject already
+    # states. Stem comparison catches wood/wooden, gold/golden, glass/glassy.
+    if materials and materials[0].lower()[:4] not in subject:
         head_parts.append(materials[0].lower())
 
     lead = " ".join(head_parts)
     opener = f"{_article(lead or subject).capitalize()} {lead} {subject}".replace("  ", " ").strip()
 
-    if colors:
-        opener += f" in {_join_natural(colors, 3)} tones"
+    seed = f"{subject}|{style}|{scene}|{mood}"
+
+    # A gold helmet should not be "gold ... finished in gold and black": the
+    # material already named that colour, so don't say it twice.
+    named = {m.lower() for m in materials[:1]}
+    palette = [c for c in colors if c.lower() not in named] or colors
+
+    if palette:
+        connective = _variant(seed, _COLOR_CONNECTIVES)
+        opener += " " + connective.format(colors=_join_natural(palette, 3))
 
     if scene and scene.lower() not in subject:
-        opener += f", set {_scene_preposition(scene)} {_article(scene)} {scene.lower()}"
+        verb = _variant(seed + "scene", _SCENE_CONNECTIVES)
+        opener += f", {verb} {_scene_preposition(scene)} {_article(scene)} {scene.lower()}"
     elif environment and not scene:
         opener += f", shown in {_article(environment)} {environment.lower()} setting"
 
@@ -368,7 +539,15 @@ def generate_description(fields: dict) -> tuple[str, float]:
     # ── Sentence 3: atmosphere ──
     if lighting and mood:
         phrase = _lighting_phrase(lighting)
-        sentences.append(f"{phrase.capitalize()} gives the piece {_article(mood)} {mood.lower()} feel.")
+        template = _variant(seed + "atmos", _ATMOSPHERE_TEMPLATES)
+        sentences.append(
+            template.format(
+                lighting=phrase,
+                lighting_cap=phrase.capitalize(),
+                mood=mood.lower(),
+                mood_article=_article(mood),
+            )
+        )
     elif lighting:
         sentences.append(f"The piece is lit with {_lighting_phrase(lighting)}.")
     elif mood:
@@ -393,9 +572,12 @@ def generate_description(fields: dict) -> tuple[str, float]:
 
 # Padding only. Used when the model returned little or nothing, so that a
 # listing is still discoverable — never at the expense of a specific tag.
+# Padding only, and deliberately free of the forbidden generics ("artwork",
+# "image", "object") — a filler tag must still be a term a buyer would search.
 _GENERIC_TAGS = [
     "nft", "digital-art", "collectible", "digital", "unique",
-    "crypto-art", "original", "artwork", "blockchain", "one-of-one",
+    "crypto-art", "original", "blockchain", "one-of-one",
+    "minted", "web3", "rare", "curated", "art-collection", "mintable",
 ]
 
 
@@ -407,8 +589,12 @@ _WEAK_FRAGMENTS = {
 }
 
 
+MIN_TAGS = 15
+MAX_TAGS = 30
+
+
 def generate_tags(fields: dict, stats: ImageStats) -> list[str]:
-    """10-30 search tags, ordered most- to least-specific."""
+    """15-30 search tags, ordered most- to least-specific."""
     candidates: list[str] = []
 
     def push(value: object) -> None:
@@ -460,13 +646,13 @@ def generate_tags(fields: dict, stats: ImageStats) -> list[str]:
         tags.append(slug)
 
     for generic in _GENERIC_TAGS:
-        if len(tags) >= 10:
+        if len(tags) >= MIN_TAGS:
             break
         if generic not in seen:
             seen.add(generic)
             tags.append(generic)
 
-    return tags[:30]
+    return tags[:MAX_TAGS]
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +679,15 @@ _TRAIT_MAP = [
 _COLOR_TRAITS = ["Primary Color", "Secondary Color", "Accent Color"]
 _MATERIAL_TRAITS = ["Primary Material", "Secondary Material"]
 
+# Traits that only make sense in context. A "Room Type" on a beach photo or a
+# "Furniture Type" on a dragon is noise, so each is gated on what the image
+# actually is — conditional traits are what make rarity ranking meaningful
+# within a collection rather than across unrelated ones.
+_ROOM_SCENES = {
+    "Living Room", "Bedroom", "Kitchen", "Dining Room", "Bathroom", "Office",
+}
+_INDOOR_OUTDOOR = {"Indoor", "Outdoor"}
+
 
 def generate_attributes(fields: dict, stats: ImageStats) -> list[Attribute]:
     """Every meaningful facet becomes a filterable trait — rarity analysis is
@@ -510,6 +705,19 @@ def generate_attributes(fields: dict, stats: ImageStats) -> list[Attribute]:
     for name, material in zip(_MATERIAL_TRAITS, fields.get("materials") or []):
         attributes.append(Attribute(trait_type=name, value=material))
 
+    # -- conditional traits -------------------------------------------------
+    scene = fields.get("scene")
+    if scene in _ROOM_SCENES:
+        attributes.append(Attribute(trait_type="Room Type", value=str(scene)))
+
+    subject = fields.get("primary_subject")
+    if subject and fields.get("category") == "Furniture":
+        attributes.append(Attribute(trait_type="Furniture Type", value=str(subject)))
+
+    environment = fields.get("environment")
+    if environment in _INDOOR_OUTDOOR:
+        attributes.append(Attribute(trait_type="Setting", value=str(environment)))
+
     attributes.append(Attribute(trait_type="Orientation", value=stats.orientation))
 
     if stats.is_grayscale:
@@ -526,6 +734,11 @@ def generate_attributes(fields: dict, stats: ImageStats) -> list[Attribute]:
         attributes.append(
             Attribute(trait_type="Color Count", value=color_count, display_type="number")
         )
+    subject_count = (1 if subject else 0) + len(fields.get("secondary_subjects") or [])
+    if subject_count:
+        attributes.append(
+            Attribute(trait_type="Subject Count", value=subject_count, display_type="number")
+        )
 
     return attributes
 
@@ -533,6 +746,49 @@ def generate_attributes(fields: dict, stats: ImageStats) -> list[Attribute]:
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
+
+def _apply_confidence_floor(fields: dict, confidence: dict[str, float]) -> None:
+    """Drop anything we are not confident enough to pre-fill. Returning null
+    beats returning a plausible guess the creator has to notice and correct."""
+    weak = [key for key, score in confidence.items() if score < MIN_CONFIDENCE]
+    for key in weak:
+        fields.pop(key, None)
+        del confidence[key]
+
+
+def _fill_gaps(fields: dict, confidence: dict[str, float], stats: ImageStats) -> None:
+    """Deduce fields the model skipped. Never overwrites a direct observation.
+
+    Order matters: scene is filled before environment, because environment is
+    derived from scene.
+    """
+    if not fields.get("scene"):
+        scene, score = infer_scene(fields)
+        if scene:
+            fields["scene"] = scene
+            confidence["scene"] = score
+
+    if not fields.get("environment"):
+        environment, score = infer_environment(fields)
+        if environment:
+            fields["environment"] = environment
+            confidence["environment"] = score
+
+    if not fields.get("materials"):
+        materials, score = infer_materials(fields)
+        if materials:
+            fields["materials"] = materials
+            confidence["materials"] = score
+
+    if not fields.get("lighting") and stats.lighting:
+        fields["lighting"] = stats.lighting
+        confidence["lighting"] = stats.lighting_confidence
+
+    if not fields.get("composition"):
+        composition, score = infer_composition(fields, stats)
+        fields["composition"] = composition
+        confidence["composition"] = score
+
 
 def generate_metadata(raw: dict, stats: ImageStats) -> NFTMetadata:
     fields, confidence = normalize_fields(raw)
@@ -543,11 +799,10 @@ def generate_metadata(raw: dict, stats: ImageStats) -> NFTMetadata:
         fields["category"] = category
         confidence["category"] = category_conf
 
-    # Only derive composition if the model did not already provide one.
-    if not fields.get("composition"):
-        composition, composition_conf = infer_composition(fields, stats)
-        fields["composition"] = composition
-        confidence["composition"] = composition_conf
+    # Fill gaps before the floor runs, so a deduced value gets its own score
+    # rather than inheriting the absence it replaced.
+    _fill_gaps(fields, confidence, stats)
+    _apply_confidence_floor(fields, confidence)
 
     title, title_conf = generate_title(fields)
     description, description_conf = generate_description(fields)

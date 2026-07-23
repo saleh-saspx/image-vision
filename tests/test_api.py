@@ -64,7 +64,7 @@ class TestGenerateEndpoint:
     @patch.object(vision_service, "analyze", return_value=MOCK_FIELDS)
     def test_successful_generation(self, mock_analyze, client):
         resp = client.post(
-            "/api/v1/generate",
+            "/api/v1/generate/sync",
             files={"file": ("test.png", _make_test_image(), "image/png")},
         )
         assert resp.status_code == 200
@@ -79,14 +79,14 @@ class TestGenerateEndpoint:
         assert meta["style"] == "Cyberpunk"
         assert meta["dominant_colors"]
         assert meta["visual_complexity"] in {"Simple", "Medium", "Complex", "Highly Detailed"}
-        assert 10 <= len(meta["tags"]) <= 30
+        assert 15 <= len(meta["tags"]) <= 30
         assert len(meta["attributes"]) > 6
         assert meta["confidence"]
         mock_analyze.assert_called_once()
 
     @patch.object(vision_service, "analyze", return_value=MOCK_FIELDS)
     def test_response_contains_every_spec_field(self, mock_analyze, client):
-        resp = client.post("/api/v1/generate", files={"file": ("t.png", _make_test_image(), "image/png")})
+        resp = client.post("/api/v1/generate/sync", files={"file": ("t.png", _make_test_image(), "image/png")})
         meta = resp.json()["metadata"]
         for field in (
             "title", "description", "category", "style", "primary_subject",
@@ -99,7 +99,7 @@ class TestGenerateEndpoint:
 
     @patch.object(vision_service, "analyze", return_value=MOCK_FIELDS)
     def test_confidence_is_capped(self, mock_analyze, client):
-        resp = client.post("/api/v1/generate", files={"file": ("t.png", _make_test_image(), "image/png")})
+        resp = client.post("/api/v1/generate/sync", files={"file": ("t.png", _make_test_image(), "image/png")})
         confidence = resp.json()["metadata"]["confidence"]
         assert confidence
         assert all(0 < v <= 0.9 for v in confidence.values())
@@ -107,7 +107,7 @@ class TestGenerateEndpoint:
     @patch.object(vision_service, "analyze", return_value={})
     def test_degrades_gracefully_when_model_returns_nothing(self, mock_analyze, client):
         """Pixel-derived metadata must survive a useless model response."""
-        resp = client.post("/api/v1/generate", files={"file": ("t.png", _make_test_image(), "image/png")})
+        resp = client.post("/api/v1/generate/sync", files={"file": ("t.png", _make_test_image(), "image/png")})
         assert resp.status_code == 200
         meta = resp.json()["metadata"]
         assert meta["title"]
@@ -116,19 +116,19 @@ class TestGenerateEndpoint:
 
     @patch.object(vision_service, "analyze", side_effect=ValueError("bad json"))
     def test_model_failure_returns_500(self, mock_analyze, client):
-        resp = client.post("/api/v1/generate", files={"file": ("t.png", _make_test_image(), "image/png")})
+        resp = client.post("/api/v1/generate/sync", files={"file": ("t.png", _make_test_image(), "image/png")})
         assert resp.status_code == 500
 
     def test_rejects_non_image(self, client):
         resp = client.post(
-            "/api/v1/generate",
+            "/api/v1/generate/sync",
             files={"file": ("test.txt", b"not an image", "text/plain")},
         )
         assert resp.status_code == 400
 
     def test_rejects_empty_file(self, client):
         resp = client.post(
-            "/api/v1/generate",
+            "/api/v1/generate/sync",
             files={"file": ("empty.png", b"", "image/png")},
         )
         assert resp.status_code == 400
@@ -136,8 +136,8 @@ class TestGenerateEndpoint:
     @patch.object(vision_service, "analyze", return_value=MOCK_FIELDS)
     def test_cache_hit_returns_same_metadata(self, mock_analyze, client):
         image_bytes = _make_test_image()
-        first = client.post("/api/v1/generate", files={"file": ("t.png", image_bytes, "image/png")}).json()
-        second = client.post("/api/v1/generate", files={"file": ("t.png", image_bytes, "image/png")}).json()
+        first = client.post("/api/v1/generate/sync", files={"file": ("t.png", image_bytes, "image/png")}).json()
+        second = client.post("/api/v1/generate/sync", files={"file": ("t.png", image_bytes, "image/png")}).json()
 
         assert first["metadata"] == second["metadata"]
         assert first["cached"] is False
@@ -146,7 +146,7 @@ class TestGenerateEndpoint:
 
     @patch.object(vision_service, "analyze", return_value=MOCK_FIELDS)
     def test_response_schema_matches_erc721(self, mock_analyze, client):
-        resp = client.post("/api/v1/generate", files={"file": ("t.png", _make_test_image(), "image/png")})
+        resp = client.post("/api/v1/generate/sync", files={"file": ("t.png", _make_test_image(), "image/png")})
         meta = resp.json()["metadata"]
         assert isinstance(meta["name"], str)
         assert isinstance(meta["description"], str)

@@ -18,8 +18,12 @@ logger = logging.getLogger(__name__)
 INFERENCE_TIMEOUT = 120  # seconds
 
 
-def _blocking_inference(raw_bytes: bytes, image_hash: str) -> NFTResponse:
-    """CPU-bound work that must NOT run on the event loop."""
+def run_inference(raw_bytes: bytes, image_hash: str) -> NFTResponse:
+    """CPU-bound work that must NOT run on the event loop.
+
+    Shared by the queue worker and the synchronous endpoint. Caching is the
+    caller's business — both paths cache, but at different moments.
+    """
     t0 = time.monotonic()
     tag = image_hash[:12]
 
@@ -68,7 +72,7 @@ async def process_image(raw_bytes: bytes) -> NFTResponse:
         response = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                partial(_blocking_inference, raw_bytes, image_hash),
+                partial(run_inference, raw_bytes, image_hash),
             ),
             timeout=INFERENCE_TIMEOUT,
         )

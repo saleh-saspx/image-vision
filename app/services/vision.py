@@ -22,14 +22,28 @@ REVISION = os.getenv("MODEL_REVISION", "2025-01-09")
 # Short keys are not cosmetic: on CPU, decode is the dominant cost and is
 # strictly sequential, so every key character is latency. Abbreviating the
 # schema saves ~40 output tokens per request versus spelled-out field names.
+# Slot syntax matters more than it looks. The previous version wrote the slots
+# as plain English ("main subject", "other notable subjects") and a 2B model
+# copies those straight through — which is precisely where the reported
+# "Main Subject" and "Other Notable Subjects" values came from. Angle brackets
+# make an un-copied slot obvious both to the model and to the parser, which
+# discards any <...> value outright.
+#
+# Concrete example values ("sofa set", "living room") were considered and
+# rejected: a small model answers with the example when it cannot see, which
+# turns a detectable non-answer into a confident wrong one.
+#
+# "Omit keys you cannot answer" is explicit because a guessed field costs the
+# creator more attention than a missing one.
 PROMPT = (
-    "Describe this image. Reply with ONLY this JSON, no other text:\n"
-    '{"subj":"main subject","sec":["other notable subjects"],'
-    '"obj":["every visible object"],"scene":"place or setting",'
-    '"env":"indoor or outdoor","sty":"art or design style",'
-    '"med":"medium: photo, 3d render, painting, pixel art, digital art",'
-    '"mat":["materials"],"lit":"lighting","mood":"mood",'
-    '"persp":"camera angle","tex":"surface texture","pat":"pattern"}'
+    "Describe this image as JSON. Use only what you can actually see. "
+    "Omit any key you are unsure about. Reply with JSON only.\n"
+    '{"subj":"<the one main object>","sec":["<other important objects>"],'
+    '"obj":["<every object you can see>"],"scene":"<room or place>",'
+    '"env":"<indoor or outdoor>","sty":"<visual style>",'
+    '"med":"<photo, 3d render, painting, drawing or pixel art>",'
+    '"mat":["<what it is made of>"],"lit":"<lighting>","mood":"<mood>",'
+    '"persp":"<camera angle>","tex":"<surface texture>","pat":"<pattern>"}'
 )
 
 # Ceiling only — generation stops at the closing brace via EOS in practice.

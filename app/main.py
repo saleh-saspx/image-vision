@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.services.vision import vision_service
+from app.services.worker import inference_worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -16,8 +17,14 @@ logging.getLogger("pyvips").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load before starting workers so the first dequeued job never races an
+    # unloaded model.
     vision_service.load_model()
-    yield
+    inference_worker.start()
+    try:
+        yield
+    finally:
+        inference_worker.stop()
 
 
 app = FastAPI(

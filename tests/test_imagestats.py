@@ -2,7 +2,13 @@ import random
 
 from PIL import Image, ImageDraw
 
-from app.services.imagestats import analyze_pixels, extract_palette, measure_complexity, name_color
+from app.services.imagestats import (
+    analyze_pixels,
+    estimate_lighting,
+    extract_palette,
+    measure_complexity,
+    name_color,
+)
 
 
 def _solid(color, size=(200, 200)) -> Image.Image:
@@ -63,6 +69,45 @@ class TestComplexity:
     def test_label_is_from_the_controlled_vocabulary(self):
         label, _ = measure_complexity(_solid((10, 200, 10)))
         assert label in {"Simple", "Medium", "Complex", "Highly Detailed"}
+
+
+class TestLighting:
+    def test_dark_image_reads_as_night(self):
+        label, conf, brightness, _, _ = estimate_lighting(_solid((12, 12, 14)))
+        assert label == "Night"
+        assert conf > 0
+        assert brightness < 0.16
+
+    def test_dim_image_reads_as_low_light(self):
+        assert estimate_lighting(_solid((60, 60, 64)))[0] == "Low Light"
+
+    def test_warm_cast_is_detected(self):
+        assert estimate_lighting(_solid((235, 200, 140)))[0] == "Warm Light"
+
+    def test_cool_cast_is_detected(self):
+        assert estimate_lighting(_solid((150, 175, 215)))[0] == "Cool Light"
+
+    def test_bright_flat_image_reads_as_soft(self):
+        assert estimate_lighting(_solid((225, 225, 225)))[0] == "Soft Light"
+
+    def test_confidence_stays_modest(self):
+        # Brightness alone cannot prove a lighting setup; never claim it can.
+        for rgb in [(12, 12, 14), (60, 60, 64), (235, 200, 140), (150, 175, 215)]:
+            assert estimate_lighting(_solid(rgb))[1] <= 0.65
+
+
+class TestSharedThumbnail:
+    def test_small_image_is_not_copied(self):
+        from app.services.imagestats import _thumbnail
+
+        img = _solid((10, 20, 30), size=(64, 64))
+        assert _thumbnail(img, 128) is img  # no wasted copy
+
+    def test_large_image_is_downscaled(self):
+        from app.services.imagestats import _thumbnail
+
+        result = _thumbnail(_solid((10, 20, 30), size=(900, 600)), 128)
+        assert max(result.size) <= 128
 
 
 class TestAnalyzePixels:
